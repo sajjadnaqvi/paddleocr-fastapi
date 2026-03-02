@@ -1,0 +1,37 @@
+# Core ML / OCR
+paddlepaddle>=3.0.0
+paddleocr>=3.0.0
+
+# LayoutReader (reading order detection)
+# Note: layoutreader is bundled locally in the /layoutreader folder
+#       (git install is not available; see Setting Up Document Pipeline.md)
+transformers>=4.30.0
+torch>=2.0.0
+
+# LangChain Agent Framework
+langchain>=1.0.0
+langchain-classic>=1.0.0
+langchain-openai>=0.3.0
+langchain-core>=0.3.0
+langchain-community>=0.4.0
+langchain-text-splitters>=0.3.0
+
+# OpenAI API
+openai>=1.0.0
+
+# Image processing
+opencv-python>=4.8.0
+Pillow>=10.0.0
+numpy>=1.24.0
+matplotlib>=3.7.0
+
+# PDF support
+pymupdf>=1.24.0          # PDF rendering (pip install pymupdf); no external system deps
+
+# FastAPI server
+fastapi>=0.110.0
+uvicorn[standard]>=0.29.0
+python-multipart>=0.0.9
+
+# Environment
+python-dotenv>=1.0.0
