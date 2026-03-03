@@ -12,10 +12,12 @@ import os
 import uuid
 import asyncio
 from contextlib import asynccontextmanager
+from io import BytesIO
+from pathlib import Path
 from typing import Optional
 
-from fastapi import FastAPI, File, UploadFile, HTTPException
-from fastapi.responses import JSONResponse
+from fastapi import FastAPI, File, Query, UploadFile, HTTPException
+from fastapi.responses import JSONResponse, StreamingResponse, HTMLResponse
 from pydantic import BaseModel
 from dotenv import load_dotenv
 
@@ -83,6 +85,22 @@ class RegionInfo(BaseModel):
     region_type: str
     bbox: list
     confidence: float
+    page: int = 1
+
+
+class TextItem(BaseModel):
+    position: int        # reading-order index (0 = first to read)
+    text: str
+    confidence: float
+    bbox: list           # [x1, y1, x2, y2]
+    page: int = 1
+
+
+class RegionsResponse(BaseModel):
+    layout_regions: list[RegionInfo]
+    extracted_text: list[TextItem]
+    total_regions: int
+    total_text_items: int
 
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
@@ -197,17 +215,223 @@ async def query_document(body: QueryRequest):
         raise HTTPException(status_code=500, detail=f"Agent error: {str(e)}")
 
 
-@app.get("/regions", response_model=list[RegionInfo], summary="List all detected layout regions")
+@app.get("/regions", response_model=RegionsResponse, summary="List layout regions and all extracted text")
 def list_regions():
-    """Return all layout regions detected in the last analyzed document."""
-    if not state.layout_regions:
+    """
+    Return all layout regions **and** all extracted OCR text for the last
+    analyzed document.
+
+    Each `extracted_text` item includes:
+    - `position` — reading-order index (0 = first item to read)
+    - `text`     — the recognized string
+    - `confidence` — OCR confidence score (0–1, higher is better)
+    - `bbox`     — bounding box `[x1, y1, x2, y2]` in pixels
+    - `page`     — 1-based page number (always 1 for single images)
+    """
+    if not state.layout_regions and not state.ordered_text:
         raise HTTPException(status_code=404, detail="No document analyzed yet.")
-    return [
+
+    regions = [
         RegionInfo(
             region_id=r.region_id,
             region_type=r.region_type,
             bbox=r.bbox,
             confidence=round(r.confidence, 3),
+            page=getattr(r, "page", 1),
         )
         for r in state.layout_regions
     ]
+
+    text_items = [
+        TextItem(
+            position=item.get("position", i),
+            text=item["text"],
+            confidence=round(item.get("confidence", 0.0), 4),
+            bbox=item.get("bbox", []),
+            page=item.get("page", 1),
+        )
+        for i, item in enumerate(state.ordered_text)
+    ]
+
+    return RegionsResponse(
+        layout_regions=regions,
+        extracted_text=text_items,
+        total_regions=len(regions),
+        total_text_items=len(text_items),
+    )
+
+
+@app.get(
+    "/reconstruct",
+    summary="Generate a visual reconstruction of the analyzed document",
+    responses={
+        200: {
+            "description": "PNG image or HTML page",
+            "content": {"image/png": {}, "text/html": {}},
+        }
+    },
+)
+async def reconstruct_document(
+    mode: str = Query(
+        "annotated",
+        description=(
+            "Reconstruction mode:\n"
+            "- **annotated** *(default)* — original image with colored region boxes + labels\n"
+            "- **text_layout** — white canvas with OCR text placed at detected coordinates\n"
+            "- **crops** — grid of all cropped layout-region thumbnails with labels\n"
+            "- **html** — standalone HTML with positioned text & region overlays"
+        ),
+    ),
+    page: int = Query(1, ge=1, description="Page number to reconstruct (1-based; for PDFs only)"),
+    show_text_boxes: bool = Query(
+        False, description="(annotated mode) Also draw OCR word bounding boxes"
+    ),
+    show_layout_boxes: bool = Query(
+        True, description="(annotated mode) Draw layout-region bounding boxes"
+    ),
+):
+    """
+    Generate a visual representation of the **last analyzed document**.
+
+    | Mode | Returns | Description |
+    |---|---|---|
+    | `annotated` | PNG | Original image with colored region boxes and type labels |
+    | `text_layout` | PNG | White canvas — every OCR word placed at its spatial coordinates |
+    | `crops` | PNG | Thumbnail grid of every detected layout region |
+    | `html` | HTML | Positioned text + region overlays as a standalone web page |
+
+    For **PDF** documents use `?page=N` (1-based) to select which page to reconstruct.
+    """
+    if not state.layout_regions and not state.ordered_text:
+        raise HTTPException(
+            status_code=400,
+            detail="No document analyzed yet. POST a document to /analyze first.",
+        )
+
+    from image_reconstruction import (
+        reconstruct_annotated,
+        reconstruct_text_layout,
+        reconstruct_crops_grid,
+        export_as_html,
+        image_to_bytes,
+    )
+
+    # ── Resolve source image path for the requested page ──────────────────────
+    def _page_image_path(page_num: int) -> str:
+        """Return the PNG path for the given page number."""
+        if not state.is_pdf:
+            return state.last_image_path
+        # PDF page images are stored alongside the PDF:
+        # uploads/<stem>_pages/page_NNN.png  (written by pdf_utils)
+        pdf_path = state.last_image_path
+        pages_dir = os.path.join(
+            os.path.dirname(pdf_path),
+            f"{Path(pdf_path).stem}_pages",
+        )
+        page_img = os.path.join(pages_dir, f"page_{page_num:03d}.png")
+        if not os.path.exists(page_img):
+            raise HTTPException(
+                status_code=404,
+                detail=(
+                    f"Page {page_num} image not found. "
+                    f"This PDF has {state.page_count} page(s)."
+                ),
+            )
+        return page_img
+
+    # ── Effective page number (always 1 for single images) ────────────────────
+    eff_page = page if state.is_pdf else 1
+    if state.is_pdf and page > state.page_count:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Page {page} requested but document only has {state.page_count} page(s).",
+        )
+
+    mode = mode.strip().lower()
+    try:
+        # ── annotated ─────────────────────────────────────────────────────────
+        if mode == "annotated":
+            img_path = _page_image_path(eff_page)
+            loop = asyncio.get_running_loop()
+            img = await loop.run_in_executor(
+                None,
+                lambda: reconstruct_annotated(
+                    image_path=img_path,
+                    layout_regions=state.layout_regions,
+                    ordered_text=state.ordered_text,
+                    show_text_boxes=show_text_boxes,
+                    show_layout_boxes=show_layout_boxes,
+                    page=eff_page,
+                ),
+            )
+            return StreamingResponse(
+                BytesIO(image_to_bytes(img)),
+                media_type="image/png",
+                headers={"Content-Disposition": f'inline; filename="annotated_page{eff_page}.png"'},
+            )
+
+        # ── text_layout ───────────────────────────────────────────────────────
+        elif mode == "text_layout":
+            # Use the source image dimensions as canvas size when available
+            try:
+                from PIL import Image as _PIL
+                with _PIL.open(_page_image_path(eff_page)) as _src:
+                    canvas_size = (_src.width, _src.height)
+            except Exception:
+                canvas_size = (1200, 1600)
+
+            loop = asyncio.get_running_loop()
+            img = await loop.run_in_executor(
+                None,
+                lambda: reconstruct_text_layout(
+                    ordered_text=state.ordered_text,
+                    canvas_size=canvas_size,
+                    page=eff_page,
+                ),
+            )
+            return StreamingResponse(
+                BytesIO(image_to_bytes(img)),
+                media_type="image/png",
+                headers={"Content-Disposition": f'inline; filename="text_layout_page{eff_page}.png"'},
+            )
+
+        # ── crops ─────────────────────────────────────────────────────────────
+        elif mode == "crops":
+            img_path = _page_image_path(eff_page)
+            loop = asyncio.get_running_loop()
+            img = await loop.run_in_executor(
+                None,
+                lambda: reconstruct_crops_grid(
+                    image_path=img_path,
+                    layout_regions=state.layout_regions,
+                    page=eff_page,
+                ),
+            )
+            return StreamingResponse(
+                BytesIO(image_to_bytes(img)),
+                media_type="image/png",
+                headers={"Content-Disposition": f'inline; filename="crops_page{eff_page}.png"'},
+            )
+
+        # ── html ──────────────────────────────────────────────────────────────
+        elif mode == "html":
+            html_content = export_as_html(
+                ordered_text=state.ordered_text,
+                layout_regions=state.layout_regions,
+                page=eff_page,
+            )
+            return HTMLResponse(content=html_content)
+
+        else:
+            raise HTTPException(
+                status_code=400,
+                detail=(
+                    f"Unknown mode '{mode}'. "
+                    "Valid modes: annotated, text_layout, crops, html"
+                ),
+            )
+
+    except HTTPException:
+        raise
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=f"Reconstruction error: {exc}") from exc
