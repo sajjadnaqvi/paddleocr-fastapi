@@ -28,6 +28,9 @@ matplotlib>=3.7.0
 # PDF support
 pymupdf>=1.24.0          # PDF rendering (pip install pymupdf); no external system deps
 
+# Windows PPT/PPTX support (PowerPoint COM automation)
+pywin32>=306 ; platform_system == "Windows"
+
 # FastAPI server
 fastapi>=0.110.0
 uvicorn[standard]>=0.29.0

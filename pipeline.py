@@ -159,3 +159,26 @@ def run_pipeline_pdf(pdf_path: str, dpi: int = 150, max_pages: int | None = None
           f"{len(all_ordered_text)} text regions, "
           f"{len(all_layout_regions)} layout regions).\n")
     return agent_executor, all_ordered_text, all_layout_regions, page_count
+
+
+def run_pipeline_ppt(ppt_path: str, dpi: int = 150, max_pages: int | None = None):
+    """
+    Execute the full pipeline on a PPT/PPTX file.
+
+    Steps:
+      1. Convert PPT/PPTX → PDF (ppt_utils)
+      2. Reuse the PDF pipeline
+    """
+    if not os.path.exists(ppt_path):
+        raise FileNotFoundError(f"PPT/PPTX not found: {ppt_path}")
+
+    from ppt_utils import ppt_to_pdf
+
+    print("\n=== PPT/PPTX → PDF ===")
+    pdf_path = ppt_to_pdf(ppt_path)
+    print(f"Converted to PDF: {pdf_path}")
+
+    agent_executor, ordered_text, layout_regions, page_count = run_pipeline_pdf(
+        pdf_path, dpi=dpi, max_pages=max_pages
+    )
+    return agent_executor, ordered_text, layout_regions, page_count, pdf_path

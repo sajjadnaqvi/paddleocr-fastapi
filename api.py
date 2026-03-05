@@ -31,6 +31,7 @@ class AppState:
     last_image_path: Optional[str] = None
     page_count: int = 1
     is_pdf: bool = False
+    document_type: str = "image"
 
 state = AppState()
 UPLOAD_DIR = "uploads"
@@ -104,21 +105,29 @@ class RegionsResponse(BaseModel):
 
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
-def _run_pipeline_sync(file_path: str, is_pdf: bool):
+def _run_pipeline_sync(file_path: str, doc_type: str):
     """Run the heavy pipeline in a thread to not block the event loop."""
-    if is_pdf:
+    if doc_type == "pdf":
         from pipeline import run_pipeline_pdf
         executor, ordered_text, layout_regions, page_count = run_pipeline_pdf(file_path)
         state.page_count = page_count
+        state.is_pdf = True
+    elif doc_type == "ppt":
+        from pipeline import run_pipeline_ppt
+        executor, ordered_text, layout_regions, page_count, pdf_path = run_pipeline_ppt(file_path)
+        state.page_count = page_count
+        state.is_pdf = True  # treated as paginated (via PDF conversion)
     else:
         from pipeline import run_pipeline
         executor, ordered_text, layout_regions = run_pipeline(file_path)
         state.page_count = 1
+        state.is_pdf = False
     state.agent_executor = executor
     state.ordered_text   = ordered_text
     state.layout_regions = layout_regions
-    state.last_image_path = file_path
-    state.is_pdf = is_pdf
+    # For PPT/PPTX store the converted PDF path for reconstruction.
+    state.last_image_path = pdf_path if doc_type == "ppt" else file_path
+    state.document_type = doc_type
 
 
 # ── Routes ────────────────────────────────────────────────────────────────────
@@ -129,18 +138,19 @@ def health():
         "status": "ok",
         "pipeline_ready": state.agent_executor is not None,
         "last_document": state.last_image_path,
-        "document_type": "pdf" if state.is_pdf else "image",
+        "document_type": state.document_type,
         "page_count": state.page_count,
         "regions_detected": len(state.layout_regions),
     }
 
 
-@app.post("/analyze", summary="Upload a document image or PDF and run the full pipeline")
+@app.post("/analyze", summary="Upload a document image, PDF, or PPT/PPTX and run the full pipeline")
 async def analyze_document(file: UploadFile = File(...)):
     """
-    Upload a PNG/JPG image **or a PDF**.
+    Upload a PNG/JPG image, **PDF**, or **PPT/PPTX**.
     The server will:
     1. (PDF only) Render each page to a PNG at 150 dpi
+    1b. (PPT/PPTX only) Convert slides to PDF, then render pages to PNG
     2. Run PaddleOCR text extraction per page
     3. Compute LayoutLM reading order per page
     4. Run PaddleOCR layout detection per page
@@ -148,18 +158,48 @@ async def analyze_document(file: UploadFile = File(...)):
 
     Returns a summary of detected regions and ordered text excerpt.
     """
-    ALLOWED_TYPES = {"image/png", "image/jpeg", "image/jpg", "image/tiff", "application/pdf"}
+    ALLOWED_TYPES = {
+        "image/png",
+        "image/jpeg",
+        "image/jpg",
+        "image/tiff",
+        "application/pdf",
+        "application/vnd.ms-powerpoint",
+        "application/vnd.openxmlformats-officedocument.presentationml.presentation",
+    }
     content_type = (file.content_type or "").lower()
-    if content_type not in ALLOWED_TYPES and not content_type.startswith("image/"):
+    filename_lower = (file.filename or "").lower()
+    if (
+        content_type not in ALLOWED_TYPES
+        and not content_type.startswith("image/")
+        and not filename_lower.endswith((".pdf", ".ppt", ".pptx"))
+    ):
         raise HTTPException(
             status_code=400,
-            detail=f"Unsupported file type '{content_type}'. Supported: PNG, JPG, TIFF, PDF."
+            detail=(
+                f"Unsupported file type '{content_type}'. "
+                "Supported: PNG, JPG, TIFF, PDF, PPT, PPTX."
+            ),
         )
 
-    is_pdf = content_type == "application/pdf" or (file.filename or "").lower().endswith(".pdf")
+    is_pdf = content_type == "application/pdf" or filename_lower.endswith(".pdf")
+    is_ppt = (
+        content_type in {
+            "application/vnd.ms-powerpoint",
+            "application/vnd.openxmlformats-officedocument.presentationml.presentation",
+        }
+        or filename_lower.endswith(".ppt")
+        or filename_lower.endswith(".pptx")
+    )
+    doc_type = "ppt" if is_ppt else ("pdf" if is_pdf else "image")
 
     # Save upload
-    ext = ".pdf" if is_pdf else (os.path.splitext(file.filename or "")[-1] or ".png")
+    if is_ppt:
+        ext = os.path.splitext(file.filename or "")[-1] or ".pptx"
+    elif is_pdf:
+        ext = ".pdf"
+    else:
+        ext = os.path.splitext(file.filename or "")[-1] or ".png"
     filename = f"{uuid.uuid4().hex}{ext}"
     file_path = os.path.join(UPLOAD_DIR, filename)
     with open(file_path, "wb") as f:
@@ -169,7 +209,7 @@ async def analyze_document(file: UploadFile = File(...)):
     # Run pipeline in thread pool to avoid blocking the event loop
     try:
         loop = asyncio.get_running_loop()
-        await loop.run_in_executor(None, _run_pipeline_sync, file_path, is_pdf)
+        await loop.run_in_executor(None, _run_pipeline_sync, file_path, doc_type)
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Pipeline error: {str(e)}")
 
@@ -181,7 +221,7 @@ async def analyze_document(file: UploadFile = File(...)):
 
     return {
         "status": "ready",
-        "document_type": "pdf" if is_pdf else "image",
+        "document_type": doc_type,
         "page_count": state.page_count,
         "file_saved_as": filename,
         "regions_detected": len(state.layout_regions),
@@ -300,7 +340,7 @@ async def reconstruct_document(
     | `crops` | PNG | Thumbnail grid of every detected layout region |
     | `html` | HTML | Positioned text + region overlays as a standalone web page |
 
-    For **PDF** documents use `?page=N` (1-based) to select which page to reconstruct.
+    For **PDF** and **PPT/PPTX** documents use `?page=N` (1-based) to select which page to reconstruct.
     """
     if not state.layout_regions and not state.ordered_text:
         raise HTTPException(
